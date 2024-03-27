@@ -15,9 +15,12 @@ import logging
 import os
 import uuid
 from copy import deepcopy
+import torch
+import torch.distributed as dist
 from typing import Any, Dict, Optional, Tuple
 
 import lightning.pytorch as pl
+from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.memory import garbage_collection_cuda, is_oom_error
 from lightning.pytorch.utilities.parsing import lightning_getattr, lightning_setattr
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_warn
@@ -59,6 +62,10 @@ def _scale_batch_size(
             - ``trainer.datamodule`` (the datamodule passed to the tune method)
 
     """
+    # Binary search doesn't support multi gpu batch finder yet
+    if trainer._accelerator_connector.is_distributed and mode == "binsearch":
+        raise MisconfigurationException("The Batch size finder is not supported with distributed strategies.")
+
     if trainer.fast_dev_run:
         rank_zero_warn("Skipping batch size scaler since `fast_dev_run` is enabled.")
         return None
@@ -145,6 +152,18 @@ def __scale_batch_restore_params(trainer: "pl.Trainer", params: Dict[str, Any]) 
 
     loop = trainer._active_loop
     assert loop is not None
+
+    loop.load_state_dict(deepcopy(params["loop_state_dict"]))
+    if isinstance(loop, pl.loops._EvaluationLoop) and "loop_verbose" in params:
+        loop.verbose = params["loop_verbose"]
+
+    # make sure the loop's state is reset
+    _reset_dataloaders(trainer)
+    # have to set max_step = -1 in order to set restarting = False
+    loop.epoch_loop.max_steps = -1
+    loop.reset()
+    loop.restarting = False
+
     if isinstance(loop, pl.loops._FitLoop):
         loop.epoch_loop.max_steps = params["max_steps"]
         trainer.limit_train_batches = params["limit_train_batches"]
@@ -153,15 +172,6 @@ def __scale_batch_restore_params(trainer: "pl.Trainer", params: Dict[str, Any]) 
         stage = trainer.state.stage
         assert stage is not None
         setattr(trainer, f"limit_{stage.dataloader_prefix}_batches", params["limit_eval_batches"])
-
-    loop.load_state_dict(deepcopy(params["loop_state_dict"]))
-    loop.restarting = False
-    if isinstance(loop, pl.loops._EvaluationLoop) and "loop_verbose" in params:
-        loop.verbose = params["loop_verbose"]
-
-    # make sure the loop's state is reset
-    _reset_dataloaders(trainer)
-    loop.reset()
 
 
 def _run_power_scaling(
@@ -183,25 +193,33 @@ def _run_power_scaling(
 
         try:
             _try_loop_run(trainer, params)
-            new_size, changed = _adjust_batch_size(trainer, batch_arg_name, factor=2.0, desc="succeeded")
+            result = torch.tensor(0).to(device="cuda")
 
-            if not changed:
-                break
-
-            # Force the train dataloader to reset as the batch size has changed
-            _reset_dataloaders(trainer)
-            any_success = True
         except RuntimeError as exception:
             if is_oom_error(exception):
                 # If we fail in power mode, half the size and return
                 garbage_collection_cuda()
+            else:
+                log.warning("WARNING!!!!! other error than oom is detected")
+                raise  # some other error not memory related
+            result = torch.tensor(1).to(device="cuda")
+
+        finally:
+            dist.all_reduce(result)
+            if torch.eq(result, torch.tensor(0)):
+                new_size, changed = _adjust_batch_size(trainer, batch_arg_name, factor=2.0, desc="succeeded")
+                # Force the train dataloader to reset as the batch size has changed
+                _reset_dataloaders(trainer)
+                any_success = True
+
+                if not changed:
+                    break
+            else:
                 new_size, _ = _adjust_batch_size(trainer, batch_arg_name, factor=0.5, desc="failed")
                 # Force the train dataloader to reset as the batch size has changed
                 _reset_dataloaders(trainer)
                 if any_success:
                     break
-            else:
-                raise  # some other error not memory related
 
     return new_size
 

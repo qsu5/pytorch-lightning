@@ -133,8 +133,6 @@ class BatchSizeFinder(Callback):
 
     @override
     def setup(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", stage: Optional[str] = None) -> None:
-        if trainer._accelerator_connector.is_distributed:
-            raise MisconfigurationException("The Batch size finder is not supported with distributed strategies.")
         # TODO: check if this can be enabled (#4040)
         if not trainer.fit_loop._data_source.is_module():
             raise MisconfigurationException(

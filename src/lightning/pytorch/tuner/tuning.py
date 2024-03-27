@@ -91,10 +91,14 @@ class Tuner:
         )
         # do not continue with the loop in case Tuner is used
         batch_size_finder._early_exit = True
-        self._trainer.callbacks = [batch_size_finder] + self._trainer.callbacks
+        config_callbacks = self._trainer.callbacks
+        self._trainer.callbacks = [batch_size_finder]
 
         if method == "fit":
             self._trainer.fit(model, train_dataloaders, val_dataloaders, datamodule)
+            # this is required to reset metrics as during teardown, it is moved to cpu
+            # https://github.com/Lightning-AI/pytorch-lightning/issues/18803#issuecomment-1872508789
+            self._trainer.fit_loop.epoch_loop.val_loop._results.clear()
         elif method == "validate":
             self._trainer.validate(model, dataloaders, datamodule=datamodule)
         elif method == "test":
@@ -102,7 +106,7 @@ class Tuner:
         elif method == "predict":
             self._trainer.predict(model, dataloaders, datamodule=datamodule)
 
-        self._trainer.callbacks = [cb for cb in self._trainer.callbacks if cb is not batch_size_finder]
+        self._trainer.callbacks = config_callbacks
         return batch_size_finder.optimal_batch_size
 
     def lr_find(
